@@ -4,6 +4,17 @@ import pygame
 import numpy as np
 
 
+# Each obstacle is a tuple (kind, x, w, h):
+#   kind = "platform" -> solid block at x..x+w-1, h tiles tall above ground (landable on top)
+#   kind = "pit"      -> gap in floor at x..x+w-1 (h unused)
+#
+# Physics reminders (size=15, ground_y=2, JUMP_V0=2, GRAVITY=2):
+#   - max jump = +2 above the y the agent starts from (ground or platform top)
+#   - from ground (y=2): can land on h<=2, blocked horizontally by h>=3
+#   - from h=1 step (y=3): can land on h<=3; from h=3 (y=5): can land on h<=5; etc.
+#   - stair sequences with heights 1,3,5,7 force the agent to climb each step
+
+
 class PicoParkEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 10}
 
@@ -15,15 +26,20 @@ class PicoParkEnv(gym.Env):
         # Platformer physics
         self.ground_y = 2
         self.JUMP_V0 = 2   # initial vertical velocity on jump
-        self.GRAVITY = 1   # vy decreases by this each step
+        self.GRAVITY = 2   # vy decreases by this each step → peak jump height = 2 above ground
 
-        # Observations: agent + target positions, plus current vertical velocity
-        # so the policy knows whether it is airborne and committed to an arc.
+        # Observations: agent + target positions, current vertical velocity,
+        # and a compact encoding of the next obstacle ahead so the policy can react.
+        # next_obstacle = [kind, dx, size]
+        #   kind: 0 = none (sentinel), 1 = platform, 2 = pit
+        #   dx:   tiles from agent to obstacle's left edge (clamped at self.size)
+        #   size: platform height OR pit width
         self.observation_space = spaces.Dict(
             {
                 "agent": spaces.Box(0, size - 1, shape=(2,), dtype=np.int32),
                 "target": spaces.Box(0, size - 1, shape=(2,), dtype=np.int32),
-                "vy": spaces.Box(-3, self.JUMP_V0, shape=(1,), dtype=np.int32),
+                "vy": spaces.Box(-5, self.JUMP_V0, shape=(1,), dtype=np.int32),
+                "next_obstacle": spaces.Box(0, size, shape=(3,), dtype=np.int32),
             }
         )
 
@@ -50,7 +66,95 @@ class PicoParkEnv(gym.Env):
             "agent": self._agent_location,
             "target": self._target_location,
             "vy": np.array([self._vy], dtype=np.int32),
+            "next_obstacle": self._next_obstacle_ahead(),
         }
+
+    def _generate_obstacles(self):
+        # Procedural: pick one of the 5 challenge templates, then sample its parameters.
+        templates = [
+            self._challenge_A_ascending,
+            self._challenge_B_stairs,
+            self._challenge_C_wall_drop,
+            self._challenge_D_gap,
+            self._challenge_E_tall_wall,
+        ]
+        idx = self.np_random.integers(0, len(templates))
+        return templates[idx]()
+
+    # --- challenge templates ---
+    # Each returns a list of (kind, x, w, h) tuples with randomized params.
+    # Standalone platforms: h <= 2 (jumpable from ground).
+    # Stair/ascending platforms: heights step by +2 so each one is only reachable
+    #   from the previous step. From y, max reach is y+2 (peak), so plat heights
+    #   1, 3, 5, 7 mean h_{i+1} requires landing on h_i first.
+
+    def _challenge_A_ascending(self):
+        # 3 platforms at heights 1, 3, 5 with pits in the gaps.
+        # Pits prevent the agent from getting stranded on the ground between platforms
+        # (where it'd be walled in by both sides since plat heights >= 3 block from ground).
+        start_x = int(self.np_random.integers(3, 6))
+        obstacles = []
+        for i in range(3):
+            x = start_x + i * 2
+            obstacles.append(("platform", x, 1, 1 + 2 * i))
+            if i < 2:
+                obstacles.append(("pit", x + 1, 1, 0))
+        return obstacles
+
+    def _challenge_B_stairs(self):
+        # 2 or 3 adjacent stairs at heights 1, 3, [5] — forces stair-climbing.
+        n_steps = int(self.np_random.integers(2, 4))
+        start_x = int(self.np_random.integers(3, 9))
+        return [
+            ("platform", start_x + i, 1, 1 + 2 * i)
+            for i in range(n_steps)
+        ]
+
+    def _challenge_C_wall_drop(self):
+        # Platform to climb, then a pit just past it.
+        wall_x = int(self.np_random.integers(4, 7))
+        wall_h = int(self.np_random.integers(1, 3))  # 1 or 2
+        pit_x = wall_x + int(self.np_random.integers(2, 4))
+        pit_w = int(self.np_random.integers(2, 4))   # 2 or 3
+        return [("platform", wall_x, 1, wall_h), ("pit", pit_x, pit_w, 0)]
+
+    def _challenge_D_gap(self):
+        pit_x = int(self.np_random.integers(5, 10))
+        pit_w = int(self.np_random.integers(2, 4))   # 2 or 3
+        return [("pit", pit_x, pit_w, 0)]
+
+    def _challenge_E_tall_wall(self):
+        wall_x = int(self.np_random.integers(5, 10))
+        return [("platform", wall_x, 1, 2)]  # max landable height
+
+    def _next_obstacle_ahead(self):
+        agent_x = int(self._agent_location[0])
+        best_kind, best_dx, best_size = 0, self.size, 0
+        for kind, ox, ow, oh in self._obstacles:
+            # Skip obstacles whose right edge is behind the agent.
+            if ox + ow - 1 < agent_x:
+                continue
+            dx = max(0, ox - agent_x)
+            if dx < best_dx:
+                best_dx = dx
+                if kind == "platform":
+                    best_kind, best_size = 1, oh
+                else:  # pit
+                    best_kind, best_size = 2, ow
+        return np.array([best_kind, best_dx, best_size], dtype=np.int32)
+
+    def _is_grounded(self, x, y):
+        # On floor (and not over a pit)
+        if y == self.ground_y:
+            for kind, ox, ow, _ in self._obstacles:
+                if kind == "pit" and ox <= x <= ox + ow - 1:
+                    return False
+            return True
+        # On top of a platform
+        for kind, ox, ow, oh in self._obstacles:
+            if kind == "platform" and y == self.ground_y + oh and ox <= x <= ox + ow - 1:
+                return True
+        return False
 
     def _get_info(self):
         return {
@@ -72,6 +176,9 @@ class PicoParkEnv(gym.Env):
         # Physics state
         self._vy = 0          # vertical velocity
 
+        # Procedurally generate this episode's obstacles
+        self._obstacles = self._generate_obstacles()
+
         observation = self._get_obs()
         info = self._get_info()
 
@@ -83,39 +190,80 @@ class PicoParkEnv(gym.Env):
     def step(self, action):
         self.current_step += 1
         prev_location = self._agent_location.copy()
+        prev_x, prev_y = int(prev_location[0]), int(prev_location[1])
 
         h_dir = int(action[0])      # 0=left, 1=none, 2=right
         jump_btn = int(action[1])   # 0/1
         dx = h_dir - 1              # -> -1, 0, +1
 
-        # Position is the source of truth: jumps are only allowed when standing on the ground.
-        grounded = self._agent_location[1] == self.ground_y
-        if grounded and jump_btn:
+        # Jumps allowed when standing on the floor OR on top of a platform (and not over a pit).
+        if self._is_grounded(prev_x, prev_y) and jump_btn:
             self._vy = self.JUMP_V0
 
-        # Apply kinematics: x_{t+1} = x_t + dx,  y_{t+1} = y_t + vy_t,  vy_{t+1} = vy_t - g
-        self._agent_location[0] += dx
-        self._agent_location[1] += self._vy
+        # Apply kinematics. Capture cur_vy BEFORE gravity so it reflects this step's motion.
+        cur_vy = self._vy
+        new_x = int(np.clip(prev_x + dx, 0, self.size - 1))
+        new_y = prev_y + cur_vy
         self._vy -= self.GRAVITY
 
-        # Land on the ground: clamp y and zero out vertical velocity.
-        if self._agent_location[1] <= self.ground_y:
-            self._agent_location[1] = self.ground_y
+        # Platform side collision: block horizontal motion into the side of a platform.
+        for kind, ox, ow, oh in self._obstacles:
+            if kind != "platform":
+                continue
+            plat_top = self.ground_y + oh
+            if ox <= new_x <= ox + ow - 1 and self.ground_y <= new_y < plat_top:
+                new_x = prev_x
+                break
+
+        # Platform landing: if falling onto a platform top, snap y to it.
+        for kind, ox, ow, oh in self._obstacles:
+            if kind != "platform":
+                continue
+            plat_top = self.ground_y + oh
+            if ox <= new_x <= ox + ow - 1:
+                if cur_vy <= 0 and prev_y >= plat_top and new_y <= plat_top:
+                    new_y = plat_top
+                    self._vy = 0
+                    break
+
+        # Phase-through guard: if vy is large-negative the agent can jump sideways from
+        # mid-air into a platform with new_y far below the platform's vertical range,
+        # so the side check above doesn't fire. Push x back to block the move.
+        if new_y < self.ground_y:
+            for kind, ox, ow, _ in self._obstacles:
+                if kind == "platform" and ox <= new_x <= ox + ow - 1:
+                    new_x = prev_x
+                    break
+
+        # Pit-aware floor clamp: only clamp at ground_y if NOT over a pit.
+        over_pit = any(
+            kind == "pit" and ox <= new_x <= ox + ow - 1
+            for kind, ox, ow, _ in self._obstacles
+        )
+        if not over_pit and new_y <= self.ground_y:
+            new_y = self.ground_y
             self._vy = 0
 
-        # Stay inside the grid horizontally.
-        self._agent_location[0] = np.clip(self._agent_location[0], 0, self.size - 1)
+        self._agent_location[0] = new_x
+        self._agent_location[1] = new_y
 
-        terminated = np.array_equal(self._agent_location, self._target_location)
+        # Out condition: agent fell off the bottom via a pit.
+        fell_out = new_y <= 0
+
+        terminated = np.array_equal(self._agent_location, self._target_location) or fell_out
         truncated = self.current_step >= self.max_steps
 
-        # Reward function: shaped progress + small step cost + terminal bonus
+        # Reward function: shaped progress + small step cost + terminal bonus / penalty
         prev_distance = np.linalg.norm(prev_location - self._target_location, ord=1)
         curr_distance = np.linalg.norm(self._agent_location - self._target_location, ord=1)
 
-        reward = 0.1 * (prev_distance - curr_distance) - 0.01
-        if terminated:
+        reward = 0.1 * (prev_distance - curr_distance) - 0.05
+        if np.array_equal(self._agent_location, self._target_location):
             reward += 1.0
+        if fell_out:
+            reward -= 1.0
+        if truncated:
+            reward -= 1.0  # Penalize stalling as much as dying so the agent risks jumps.
 
         observation = self._get_obs()
         info = self._get_info()
@@ -165,6 +313,31 @@ class PicoParkEnv(gym.Env):
         for col in range(self.size + 1):
             x = pix_square_size * col
             pygame.draw.line(canvas, grid_color, (x, 0), (x, floor_top_px), width=1)
+
+        # Draw obstacles. Pits are white rects punched through the floor; platforms are orange blocks above it.
+        orange = (255, 140, 75)
+        for kind, ox, ow, oh in self._obstacles:
+            if kind == "pit":
+                x_px = ox * pix_square_size
+                w_px = ow * pix_square_size
+                pygame.draw.rect(
+                    canvas,
+                    (255, 255, 255),
+                    pygame.Rect(x_px, floor_top_px, w_px, self.window_size - floor_top_px),
+                )
+            elif kind == "platform":
+                # Platform occupies game-y in [ground_y, ground_y + oh - 1]; top surface at y = ground_y + oh.
+                top_row = self.size - (self.ground_y + oh)
+                pygame.draw.rect(
+                    canvas,
+                    orange,
+                    pygame.Rect(
+                        ox * pix_square_size,
+                        top_row * pix_square_size,
+                        ow * pix_square_size,
+                        oh * pix_square_size,
+                    ),
+                )
 
         # Draw the target as a 2-tall door (occupies game-y in [ground_y, ground_y + 1]).
         door_top = to_screen(self._target_location + np.array([0, 1])) * pix_square_size

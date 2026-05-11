@@ -36,7 +36,7 @@ model = DQN(
     verbose=0,
 )
 
-total_timesteps = 200_000
+total_timesteps = 500_000
 model.learn(total_timesteps=total_timesteps, progress_bar=True)
 
 model.save("dqn_picopark")

@@ -18,7 +18,7 @@ import numpy as np
 class PicoParkEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 10}
 
-    def __init__(self, render_mode=None, size=15):
+    def __init__(self, render_mode=None, size=25):
         self.size = size  # The size of the square grid
         self.window_size = 512  # The size of the PyGame window
         self.max_steps = 200 # Maximum steps to ensure episodes end
@@ -70,7 +70,7 @@ class PicoParkEnv(gym.Env):
         }
 
     def _generate_obstacles(self):
-        # Procedural: pick one of the 5 challenge templates, then sample its parameters.
+        # Procedural: chain 2 or 3 challenge templates back-to-back with spacing between them.
         templates = [
             self._challenge_A_ascending,
             self._challenge_B_stairs,
@@ -78,21 +78,31 @@ class PicoParkEnv(gym.Env):
             self._challenge_D_gap,
             self._challenge_E_tall_wall,
         ]
-        idx = self.np_random.integers(0, len(templates))
-        return templates[idx]()
+        n_challenges = int(self.np_random.integers(2, 4))  # 2 or 3
+        door_x = self.size - 2
+        spacing = 3  # tiles of clear ground after each challenge (room to land + walk)
+
+        obstacles = []
+        cur_x = 3  # leave 3 tiles of spawn buffer on the left
+        for _ in range(n_challenges):
+            # Need ~5 tiles for the widest template + 2 buffer before the door.
+            if cur_x + 5 + 2 > door_x:
+                break
+            template = templates[int(self.np_random.integers(0, len(templates)))]
+            chunk = template(cur_x)
+            obstacles.extend(chunk)
+            max_x = max(o[1] + o[2] - 1 for o in chunk)
+            cur_x = max_x + spacing
+        return obstacles
 
     # --- challenge templates ---
-    # Each returns a list of (kind, x, w, h) tuples with randomized params.
+    # Each takes start_x and returns a list of (kind, x, w, h) tuples positioned there.
     # Standalone platforms: h <= 2 (jumpable from ground).
     # Stair/ascending platforms: heights step by +2 so each one is only reachable
-    #   from the previous step. From y, max reach is y+2 (peak), so plat heights
-    #   1, 3, 5, 7 mean h_{i+1} requires landing on h_i first.
+    #   from the previous step.
 
-    def _challenge_A_ascending(self):
-        # 3 platforms at heights 1, 3, 5 with pits in the gaps.
-        # Pits prevent the agent from getting stranded on the ground between platforms
-        # (where it'd be walled in by both sides since plat heights >= 3 block from ground).
-        start_x = int(self.np_random.integers(3, 6))
+    def _challenge_A_ascending(self, start_x):
+        # 3 platforms at heights 1, 3, 5 with 1-wide pits in the gaps.
         obstacles = []
         for i in range(3):
             x = start_x + i * 2
@@ -101,31 +111,29 @@ class PicoParkEnv(gym.Env):
                 obstacles.append(("pit", x + 1, 1, 0))
         return obstacles
 
-    def _challenge_B_stairs(self):
-        # 2 or 3 adjacent stairs at heights 1, 3, [5] — forces stair-climbing.
-        n_steps = int(self.np_random.integers(2, 4))
-        start_x = int(self.np_random.integers(3, 9))
+    def _challenge_B_stairs(self, start_x):
+        n_steps = int(self.np_random.integers(2, 4))  # 2 or 3
+        return [("platform", start_x + i, 1, 1 + 2 * i) for i in range(n_steps)]
+
+    def _challenge_C_wall_drop(self, start_x):
+        wall_h = int(self.np_random.integers(1, 3))                  # 1 or 2
+        pit_off = int(self.np_random.integers(2, 4))                 # 2 or 3
+        pit_w = int(self.np_random.integers(2, 4))                   # 2 or 3
+        # Unsolvable combo: pit_off=2 + pit_w=3 leaves the agent no x-gap to land
+        # between plat and pit, and the jump-from-plat-top arc lands inside the pit.
+        if pit_off == 2 and pit_w == 3:
+            pit_w = 2
         return [
-            ("platform", start_x + i, 1, 1 + 2 * i)
-            for i in range(n_steps)
+            ("platform", start_x, 1, wall_h),
+            ("pit", start_x + pit_off, pit_w, 0),
         ]
 
-    def _challenge_C_wall_drop(self):
-        # Platform to climb, then a pit just past it.
-        wall_x = int(self.np_random.integers(4, 7))
-        wall_h = int(self.np_random.integers(1, 3))  # 1 or 2
-        pit_x = wall_x + int(self.np_random.integers(2, 4))
+    def _challenge_D_gap(self, start_x):
         pit_w = int(self.np_random.integers(2, 4))   # 2 or 3
-        return [("platform", wall_x, 1, wall_h), ("pit", pit_x, pit_w, 0)]
+        return [("pit", start_x, pit_w, 0)]
 
-    def _challenge_D_gap(self):
-        pit_x = int(self.np_random.integers(5, 10))
-        pit_w = int(self.np_random.integers(2, 4))   # 2 or 3
-        return [("pit", pit_x, pit_w, 0)]
-
-    def _challenge_E_tall_wall(self):
-        wall_x = int(self.np_random.integers(5, 10))
-        return [("platform", wall_x, 1, 2)]  # max landable height
+    def _challenge_E_tall_wall(self, start_x):
+        return [("platform", start_x, 1, 2)]  # max landable height from ground
 
     def _next_obstacle_ahead(self):
         agent_x = int(self._agent_location[0])
@@ -168,8 +176,8 @@ class PicoParkEnv(gym.Env):
         super().reset(seed=seed)
         self.current_step = 0
 
-        # Agent starts at random x near the left, on the ground; door (target) at far right.
-        start_x = self.np_random.integers(0, self.size // 4)
+        # Agent starts in the left spawn buffer; door (target) at far right.
+        start_x = self.np_random.integers(0, 3)
         self._agent_location = np.array([start_x, self.ground_y], dtype=np.int32)
         self._target_location = np.array([self.size - 2, self.ground_y], dtype=np.int32)
 

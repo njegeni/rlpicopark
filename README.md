@@ -1,4 +1,4 @@
-# 🎮 Reinforcement Learning with Pico Park
+# Reinforcement Learning with Pico Park
 
 A single-agent [Gymnasium](https://gymnasium.farama.org/) environment inspired by [Pico Park](https://store.steampowered.com/app/1325900/Pico_Park/), plus scripts to train a DQN agent to clear procedurally generated obstacle courses.
 
@@ -12,15 +12,15 @@ A single-agent [Gymnasium](https://gymnasium.farama.org/) environment inspired b
 - **DQN baseline** (Stable-Baselines3) that trains end-to-end and saves rollout videos.
 - **Play mode** so you can pilot the agent yourself with WASD / arrows.
 
-## ℹ️ Overview
+## Overview
 
 `PicoPark-v0` is a 25×25 grid platformer. The agent spawns on the left, a door spawns on the right, and 2–3 procedurally generated challenges sit between them. Reach the door to win, fall into a pit to lose, run out of steps to lose. The action space is `MultiDiscrete([3, 2])` (horizontal direction × jump button); the observation is a `Dict` with `agent`, `target`, `vy`, and a 3-tuple `next_obstacle = [kind, dx, size]` so a small policy can react without seeing the full level.
 
-The training script wraps the env with a `Discrete(6)` adapter (DQN doesn't support `MultiDiscrete`) and trains a `MultiInputPolicy` for 500k steps. `watch.py` then rolls out 15 deterministic episodes and writes [`trained_agent.mp4`](trained_agent.mp4).
+
 
 ## Usage
 
-Train a DQN agent (500k steps, takes a while):
+Train a DQN agent (500k steps):
 
 ```bash
 python train.py
